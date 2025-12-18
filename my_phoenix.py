@@ -1,6 +1,4 @@
 # Instructions
-# - source venv/bin/activate to start Python virtual environment
-# - pip3 install
 
 import os
 from openai import OpenAI
