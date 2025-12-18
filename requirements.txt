@@ -1,0 +1,11 @@
+arize-phoenix
+openinference-instrumentation-openai
+openinference-semantic-conventions
+opentelemetry-sdk
+opentelemetry-api
+openai
+pandas
+matplotlib
+duckdb
+pydantic
+ipython
