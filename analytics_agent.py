@@ -8,7 +8,26 @@ import duckdb
 from pydantic import BaseModel, Field
 from IPython.display import Markdown
 
+from phoenix.otel import register
+from openinference.instrumentation.openai import OpenAIInstrumentor
+from openinference.semconv.trace import SpanAttributes
+from opentelemetry.trace import Status, StatusCode
+from opentelemetry.sdk.trace import TracerProvider
+
+
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+PHOENIX_COLLECTOR_ENDPOINT = "http://localhost:6006"
+
+PROJECT_NAME = "analytics_agent"
+tracer_provider = register(
+    project_name=PROJECT_NAME,
+    auto_instrument=True,  # Auto-instruments OpenAI, LangChain, etc.
+    batch=False,  # Send spans immediately (recommended for local dev)
+)
+
+# traces any call to OpenAI automagically
+OpenAIInstrumentor().instrument(tracer_provider=tracer_provider)
+tracer = tracer_provider.get_tracer(__name__)  # for tracing manual tool calls
 
 MODEL = "gpt-4o-mini"
 
@@ -41,6 +60,7 @@ def generate_sql_query(prompt: str, columns: list, table_name: str) -> str:
     return response.choices[0].message.content
 
 
+@tracer.tool()
 def lookup_sales_data(prompt: str) -> str:
     """Implementation of sales data lookup from parquet file using SQL"""
 
@@ -54,6 +74,7 @@ def lookup_sales_data(prompt: str) -> str:
             f"CREATE TABLE IF NOT EXISTS {table_name} AS SELECT * FROM df")
 
         # step 2: generate the SQL code
+
         sql_query = generate_sql_query(prompt, df.columns, table_name)
         print(sql_query)
         # clean the response to make sure it only includes the SQL code
@@ -61,8 +82,11 @@ def lookup_sales_data(prompt: str) -> str:
         sql_query = sql_query.replace("```sql", "").replace("```", "")
 
         # step 3 execute the SQL query
-        result = duckdb.sql(sql_query).df()
-        print(result)
+        with tracer.start_as_current_span("execute_sql_query", openinference_span_kind="chain") as span:
+            span.set_input(sql_query)
+            result = duckdb.sql(sql_query).df()
+            span.set_output(value=str(result))
+            span.set_status(StatusCode.OK)
         return result.to_string()
     except Exception as e:
         return f"Error accessing data: {str(e)}"
@@ -74,6 +98,7 @@ Your job is to answer the following question: {prompt}
 """
 
 
+@tracer.tool()
 def analyze_sales_data(prompt: str, data: str) -> str:
     """Implementation of AI-powered sales data analysis"""
     formatted_prompt = DATA_ANALYSIS_PROMPT.format(data=data, prompt=prompt)
@@ -178,6 +203,7 @@ def create_chart(config: dict) -> str:
 # combine chart steps
 
 
+@tracer.tool()
 def generate_visualization(data: str, visualization_goal: str) -> str:
     """Generate a visualization based on the data and goal"""
     config = extract_chart_config(data, visualization_goal)
@@ -245,41 +271,52 @@ def run_agent(messages):
 
     if isinstance(messages, str):
         messages = [{"role": "user", "content": messages}]
-        print("Messages: ", messages)
+        print("Messages BEFORE system prompt: ", messages)
 
-        if not any(
-            isinstance(message, dict) and message.get('role') == "system" for message in messages
-        ):
-            system_prompt = {"role": "system", "content": SYSTEM_PROMPT}
-            messages.append(system_prompt)
-
-    print("Running agent with messages:", messages)
-
+    if not any(
+        isinstance(message, dict) and message.get('role') == "system" for message in messages
+    ):
+        system_prompt = {"role": "system", "content": SYSTEM_PROMPT}
+        messages.append(system_prompt)
     while True:
-        print("Making router call to OpenAI")
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            tools=tools,
-        )
-        messages.append(response.choices[0].message)
-        tool_calls = response.choices[0].message.tool_calls
-        print("Received response with tool calls:", bool(tool_calls))
-        print("Tool calls:", tool_calls)
+        # Router Span
+        print("Starting router call span")
+        with tracer.start_as_current_span(
+            "router_call",
+            openinference_span_kind="chain",
+        ) as span:
+            span.set_input(value=messages)
 
-        if tool_calls:
-            print("Processing tool calls")
-            messages = handle_tool_calls(tool_calls, messages)
-        else:
-            print("No tool calls, returning final response")
-            return response.choices[0].message.content
+            print("Making router call to OpenAI")
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                tools=tools,
+            )
+            messages.append(response.choices[0].message)
+            tool_calls = response.choices[0].message.tool_calls
+            print("Received response with tool calls:", bool(tool_calls))
+            span.set_status(StatusCode.OK)
+
+            if tool_calls:
+                print("Processing tool calls")
+                messages = handle_tool_calls(tool_calls, messages)
+                span.set_output(value=tool_calls)
+            else:
+                print("No tool calls, returning final response")
+                span.set_output(value=response.choices[0].message.content)
+                return response.choices[0].message.content
 
 
 SYSTEM_PROMPT = """
 You are a helpful assistent that can answer questions about the Store Sales Data
 """
 
+# Decorator below makes entire handle_tool_calls call a span in Phoenix
+# takes inputs to method as input, and return value as output to span
 
+
+@tracer.chain()
 def handle_tool_calls(tool_calls, messages):
 
     for tool_call in tool_calls:
@@ -294,6 +331,18 @@ def handle_tool_calls(tool_calls, messages):
     return messages
 
 
+def start_main_span(messages):
+    print("Starting main span with messages:", messages)
+
+    with tracer.start_as_current_span("AgentRun", openinference_span_kind="agent") as span:
+        span.set_input(value=messages)
+        ret = run_agent(messages)
+        print("Main span completed with return value:", ret)
+        span.set_output(value=ret)
+        span.set_status(StatusCode.OK)
+        return ret
+
+
 if __name__ == "__main__":
     # example_data = lookup_sales_data(
     #     "give me counts for the products in the latest month of the data")
@@ -305,7 +354,9 @@ if __name__ == "__main__":
     #     example_data, "Give me a bar-chart of monthly sales for Store 1")
     # print(viz_code)
     # exec(viz_code)
-    result = run_agent(
-        "Generate code for a chart which displays a histogram of counts for all products sold in November 2024, and share trends."
-    )
-    print(result)
+    # result = run_agent(
+    #     "Generate code for a chart which displays a histogram of counts for all products sold in November 2024, and share trends."
+    # )
+    # print(result)
+    result = start_main_span(
+        [{"role": "user", "content": "Which stores did the best in 2024?"}])
