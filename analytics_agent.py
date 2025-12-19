@@ -1,18 +1,13 @@
 import os
-from io import StringIO
 from openai import OpenAI
 import pandas as pd
-import matplotlib.pyplot as plt
 import json
 import duckdb
 from pydantic import BaseModel, Field
-from IPython.display import Markdown
 
 from phoenix.otel import register
 from openinference.instrumentation.openai import OpenAIInstrumentor
-from openinference.semconv.trace import SpanAttributes
-from opentelemetry.trace import Status, StatusCode
-from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.trace import StatusCode
 
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))

@@ -4,10 +4,6 @@ import os
 from openai import OpenAI
 
 from phoenix.otel import register
-from openinference.instrumentation.openai import OpenAIInstrumentor
-from openinference.semconv.trace import SpanAttributes
-from opentelemetry.trace import Status, StatusCode
-from opentelemetry.sdk.trace import TracerProvider
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 PHOENIX_COLLECTOR_ENDPOINT = "http://localhost:6006"
